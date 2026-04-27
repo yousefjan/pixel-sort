@@ -2,13 +2,18 @@
 using namespace metal;
 
 // --------------------------------------------------------------------
-// Bitonic-sort pixel-sorting kernel for glitch art
+// Span-based pixel sorting (Unity Pixel-Sorting port)
 //
-// Each row of the image is treated as an independent array.
-// Pixels whose brightness falls within [lower, upper] form a "sortable
-// mask."  The kernel runs successive bitonic merge passes over every
-// row; masked-out pixels stay in place while masked-in pixels are
-// compared-and-swapped by their sort key (brightness / hue / etc.).
+// Pipeline:
+// 1) createMask: mark pixels whose luminance is within thresholds
+// 2) clearSpanBuffer
+// 3) identifySpans: for each row, write span length at span start pixel
+// 4) rgbToSortValue: compute per-pixel sort value (R/G/B/L/S/H)
+// 5) pixelSortSpan: for each span start, sort pixels within the span
+// 6) composite: apply sorted pixels only where mask==1
+//
+// This matches the semantics of the reference Unity compute shader:
+// contiguous masked regions are sorted independently.
 // --------------------------------------------------------------------
 
 enum SortKey : uint {
@@ -22,11 +27,11 @@ enum SortKey : uint {
 
 // ---- helpers -------------------------------------------------------
 
-static inline float brightness(float4 c) {
-    return dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+static inline float luminance(float3 rgb) {
+    return dot(rgb, float3(0.299, 0.587, 0.114));
 }
 
-static inline float hue(float4 c) {
+static inline float hue(float3 c) {
     float cmax  = max(c.r, max(c.g, c.b));
     float cmin  = min(c.r, min(c.g, c.b));
     float delta = cmax - cmin;
@@ -40,115 +45,198 @@ static inline float hue(float4 c) {
     return h;
 }
 
-static inline float saturation(float4 c) {
+static inline float saturation(float3 c) {
     float cmax  = max(c.r, max(c.g, c.b));
     float cmin  = min(c.r, min(c.g, c.b));
     if (cmax < 1e-6) return 0.0;
     return (cmax - cmin) / cmax;
 }
 
-static inline float sort_value(float4 c, uint key) {
+static inline float sort_value(float3 rgb, uint key) {
     switch (SortKey(key)) {
-        case SortKey::Brightness:  return brightness(c);
-        case SortKey::Hue:         return hue(c);
-        case SortKey::Saturation:  return saturation(c);
-        case SortKey::Red:         return c.r;
-        case SortKey::Green:       return c.g;
-        case SortKey::Blue:        return c.b;
+        case SortKey::Brightness:  return luminance(rgb);
+        case SortKey::Hue:         return hue(rgb);
+        case SortKey::Saturation:  return saturation(rgb);
+        case SortKey::Red:         return rgb.r;
+        case SortKey::Green:       return rgb.g;
+        case SortKey::Blue:        return rgb.b;
     }
-    return brightness(c);
+    return luminance(rgb);
 }
 
 // ---- parameters passed from the CPU side ---------------------------
 
 struct Params {
-    uint  width;          // image width  (= row length)
-    uint  height;         // image height (= number of rows)
-    uint  blockSize;      // bitonic block size  (power of 2, doubles each outer pass)
-    uint  subBlockSize;   // comparison distance (power of 2, halves each inner pass)
-    uint  sortKey;        // which channel to sort by (see SortKey enum)
-    float lowerThreshold; // brightness lower bound for mask
-    float upperThreshold; // brightness upper bound for mask
-    uint  descending;     // 0 = ascending, 1 = descending
+    uint  width;
+    uint  height;
+    uint  sortKey;        // SortKey enum
+    float lowerThreshold; // luminance low
+    float upperThreshold; // luminance high
+    uint  reverseSorting; // 0 = normal, 1 = reverse
+    float gamma;          // output gamma (Unity applies pow(abs(sorted), gamma))
+    uint  maxSpanLength;  // clamp span length (safety)
+    uint  invertMask;     // 0/1
 };
 
-// ---- bitonic compare-and-swap kernel -------------------------------
-//
-// Dispatch with threads = (width/2) * height.
-// Each thread handles one compare-swap pair in the current sub-pass.
+// ---- create mask (0/1) ---------------------------------------------
 
-kernel void bitonicSortStep(
-    texture2d<float, access::read>  inputTexture  [[texture(0)]],
-    texture2d<float, access::write> outputTexture [[texture(1)]],
-    constant Params &params                       [[buffer(0)]],
-    uint2 gid                                     [[thread_position_in_grid]]
+kernel void createMask(
+    texture2d<float, access::read>  colorTex [[texture(0)]],
+    texture2d<uint, access::write>  maskTex  [[texture(1)]],
+    constant Params &params                  [[buffer(0)]],
+    uint2 gid                                [[thread_position_in_grid]]
 ) {
-    uint pairIndex = gid.x;   // which pair within this row
-    uint row       = gid.y;
-
-    if (row >= params.height) return;
-    if (pairIndex >= params.width / 2) return;
-
-    // Determine the two indices to compare.
-    uint blockSize    = params.blockSize;
-    uint subBlockSize = params.subBlockSize;
-
-    // Position within block and sub-block
-    uint blockIndex = pairIndex / (subBlockSize / 2);
-    uint offset     = pairIndex % (subBlockSize / 2);
-
-    uint leftIdx  = blockIndex * subBlockSize + offset;
-    uint rightIdx = leftIdx + subBlockSize / 2;
-
-    if (leftIdx >= params.width || rightIdx >= params.width) {
-        // Out of bounds — copy left pixel through unchanged.
-        if (leftIdx < params.width) {
-            outputTexture.write(inputTexture.read(uint2(leftIdx, row)), uint2(leftIdx, row));
-        }
-        return;
-    }
-
-    float4 leftPixel  = inputTexture.read(uint2(leftIdx, row));
-    float4 rightPixel = inputTexture.read(uint2(rightIdx, row));
-
-    // Threshold mask: only sort pixels whose brightness is in range.
-    float leftBri  = brightness(leftPixel);
-    float rightBri = brightness(rightPixel);
-    bool leftIn    = leftBri  >= params.lowerThreshold && leftBri  <= params.upperThreshold;
-    bool rightIn   = rightBri >= params.lowerThreshold && rightBri <= params.upperThreshold;
-
-    if (leftIn && rightIn) {
-        float leftVal  = sort_value(leftPixel,  params.sortKey);
-        float rightVal = sort_value(rightPixel, params.sortKey);
-
-        // Direction: ascending within even blocks, descending within odd
-        // (standard bitonic pattern), then flip if user wants descending.
-        bool ascending = ((leftIdx / blockSize) % 2 == 0);
-        if (params.descending) ascending = !ascending;
-
-        bool doSwap = ascending ? (leftVal > rightVal) : (leftVal < rightVal);
-        if (doSwap) {
-            float4 tmp = leftPixel;
-            leftPixel  = rightPixel;
-            rightPixel = tmp;
-        }
-    }
-
-    outputTexture.write(leftPixel,  uint2(leftIdx,  row));
-    outputTexture.write(rightPixel, uint2(rightIdx, row));
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    float3 rgb = saturate(colorTex.read(gid).rgb);
+    float l = luminance(rgb);
+    bool inRange = (l >= params.lowerThreshold) && (l <= params.upperThreshold);
+    uint m = inRange ? 1u : 0u;
+    if (params.invertMask) m = 1u - m;
+    maskTex.write(m, gid);
 }
 
-// ---- simple copy kernel for pixels not touched by a compare-swap ---
-//
-// After each step we need untouched pixels carried forward.  Instead of
-// a separate pass we do a full-image copy first, then the sort step
-// overwrites the pairs it touches.  This kernel does that copy.
+// ---- clear span buffer ---------------------------------------------
 
-kernel void copyTexture(
-    texture2d<float, access::read>  src [[texture(0)]],
-    texture2d<float, access::write> dst [[texture(1)]],
-    uint2 gid                           [[thread_position_in_grid]]
+kernel void clearSpanBuffer(
+    texture2d<uint, access::write> spanTex [[texture(0)]],
+    constant Params &params                [[buffer(0)]],
+    uint2 gid                              [[thread_position_in_grid]]
 ) {
-    if (gid.x >= src.get_width() || gid.y >= src.get_height()) return;
-    dst.write(src.read(gid), gid);
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    spanTex.write(0u, gid);
+}
+
+// ---- identify spans (horizontal only) ------------------------------
+// One thread per row: write span length at each span start.
+
+kernel void identifySpans(
+    texture2d<uint, access::read>  maskTex [[texture(0)]],
+    texture2d<uint, access::write> spanTex [[texture(1)]],
+    constant Params &params                [[buffer(0)]],
+    uint2 gid                              [[thread_position_in_grid]]
+) {
+    uint row = gid.y;
+    if (gid.x != 0 || row >= params.height) return;
+
+    uint pos = 0;
+    uint spanStart = 0;
+    uint spanLength = 0;
+    uint spanLimit = max(1u, params.maxSpanLength);
+
+    while (pos < params.width) {
+        uint m = maskTex.read(uint2(pos, row)).x;
+        pos += 1;
+
+        if (m == 0 || spanLength >= spanLimit) {
+            // Write at span start. Mirror Unity behavior: if we hit an unmasked pixel,
+            // spanLength is current count; if we hit limit while still masked, include current pixel.
+            if (spanLength != 0) {
+                uint outLen = (m == 1u) ? (spanLength + 1u) : spanLength;
+                spanTex.write(outLen, uint2(spanStart, row));
+            }
+            spanStart = pos;
+            spanLength = 0;
+        } else {
+            spanLength += 1;
+        }
+    }
+
+    if (spanLength != 0 && spanStart < params.width) {
+        spanTex.write(spanLength, uint2(spanStart, row));
+    }
+}
+
+// ---- per-pixel sort value ------------------------------------------
+
+kernel void rgbToSortValue(
+    texture2d<float, access::read>  colorTex [[texture(0)]],
+    texture2d<half, access::write>  valTex   [[texture(1)]],
+    constant Params &params                  [[buffer(0)]],
+    uint2 gid                                [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    float3 rgb = saturate(colorTex.read(gid).rgb);
+    float v = sort_value(rgb, params.sortKey);
+    valTex.write(half(v), gid);
+}
+
+// ---- sort pixels within a span -------------------------------------
+// One thread per pixel, but only span starts do work.
+// Writes sorted pixels into `sortedTex` for the span region.
+
+constant uint MAX_LOCAL_SPAN = 2048;
+
+kernel void pixelSortSpan(
+    texture2d<float, access::read>  colorTex  [[texture(0)]],
+    texture2d<half, access::read>   valTex    [[texture(1)]],
+    texture2d<uint, access::read>   spanTex   [[texture(2)]],
+    texture2d<float, access::write> sortedTex [[texture(3)]],
+    constant Params &params                   [[buffer(0)]],
+    uint2 gid                                 [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+
+    uint spanLength = spanTex.read(gid).x;
+    if (spanLength == 0) return;
+
+    spanLength = min(spanLength, params.width - gid.x);
+    spanLength = min(spanLength, max(1u, params.maxSpanLength));
+    spanLength = min(spanLength, MAX_LOCAL_SPAN);
+
+    // Cache sort values for this span.
+    float cache[MAX_LOCAL_SPAN];
+    for (uint k = 0; k < spanLength; ++k) {
+        cache[k] = float(valTex.read(uint2(gid.x + k, gid.y)).x);
+    }
+
+    float minValue = cache[0];
+    float maxValue = cache[0];
+    uint minIndex = 0;
+    uint maxIndex = 0;
+
+    uint steps = (spanLength / 2) + 1;
+    for (uint i = 0; i < steps; ++i) {
+        for (uint j = 1; j < spanLength; ++j) {
+            float v = cache[j];
+            // Unity checks `v == saturate(v)` to ignore sentinels; equivalent is 0..1.
+            if (v >= 0.0f && v <= 1.0f) {
+                if (v < minValue) { minValue = v; minIndex = j; }
+                if (maxValue < v) { maxValue = v; maxIndex = j; }
+            }
+        }
+
+        uint dstMin = params.reverseSorting ? i : (spanLength - i - 1);
+        uint dstMax = params.reverseSorting ? (spanLength - i - 1) : i;
+
+        float4 cMin = colorTex.read(uint2(gid.x + minIndex, gid.y));
+        float4 cMax = colorTex.read(uint2(gid.x + maxIndex, gid.y));
+
+        sortedTex.write(cMin, uint2(gid.x + dstMin, gid.y));
+        sortedTex.write(cMax, uint2(gid.x + dstMax, gid.y));
+
+        cache[minIndex] = 2.0f;
+        cache[maxIndex] = -2.0f;
+        minValue = 1.0f;
+        maxValue = -1.0f;
+    }
+}
+
+// ---- composite sorted pixels onto original -------------------------
+
+kernel void composite(
+    texture2d<uint, access::read>  maskTex     [[texture(0)]],
+    texture2d<float, access::read> sortedTex   [[texture(1)]],
+    texture2d<float, access::read> originalTex [[texture(2)]],
+    texture2d<float, access::write> outTex     [[texture(3)]],
+    constant Params &params                    [[buffer(0)]],
+    uint2 gid                                  [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+
+    float4 c = originalTex.read(gid);
+    if (maskTex.read(gid).x == 1u) {
+        float4 s = sortedTex.read(gid);
+        c = pow(abs(s), float4(params.gamma));
+    }
+    outTex.write(c, gid);
 }
