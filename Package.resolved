@@ -1,0 +1,24 @@
+{
+  "originHash" : "20bdcbfbd4056744f3ce10add451d416c8f88440e541126e9565e3bba87a6f7f",
+  "pins" : [
+    {
+      "identity" : "compute",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/schwa/Compute",
+      "state" : {
+        "revision" : "eda83091348c3cbaf735e59218ea1da36233a2eb",
+        "version" : "0.0.6"
+      }
+    },
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser",
+      "state" : {
+        "revision" : "626b5b7b2f45e1b0b1c6f4a309296d1d21d7311b",
+        "version" : "1.7.1"
+      }
+    }
+  ],
+  "version" : 3
+}
