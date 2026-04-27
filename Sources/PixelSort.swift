@@ -6,7 +6,7 @@ import Metal
 @main
 struct PixelSort: ParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "GPU-accelerated pixel sorting for glitch art"
+        abstract: "Metal-accelerated pixel sorting library"
     )
 
     @Argument(help: "Input image path")
@@ -15,7 +15,7 @@ struct PixelSort: ParsableCommand {
     @Argument(help: "Output image path")
     var output: String
 
-    @Option(name: .shortAndLong, help: "Sort key: brightness, hue, saturation, red, green, blue")
+    @Option(name: .shortAndLong, help: "Sort key: brightness, hue, saturation, R, G, B")
     var key: SortKeyOption = .brightness
 
     @Option(name: .shortAndLong, help: "Lower brightness threshold (0.0–1.0)")
@@ -40,14 +40,13 @@ struct PixelSort: ParsableCommand {
         let device = MTLCreateSystemDefaultDevice()!
         let compute = try Compute(device: device)
 
-        // Load image into a Metal texture
         let inputURL = URL(fileURLWithPath: input)
         let outputURL = URL(fileURLWithPath: self.output)
 
         guard let nsImage = NSImage(contentsOf: inputURL),
-              let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else {
-            throw ValidationError("Could not load image at \(input)")
+            throw ValidationError("Could not load image")
         }
 
         let width = cgImage.width
@@ -89,30 +88,21 @@ struct PixelSort: ParsableCommand {
         let spanTex = device.makeTexture(descriptor: spanDesc)!
         spanTex.label = "spans"
 
-        let valDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r16Float,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        valDesc.usage = [.shaderRead, .shaderWrite]
-        let valTex = device.makeTexture(descriptor: valDesc)!
-        valTex.label = "sortValues"
-
-        // Upload pixel data
         let bytesPerPixel = 4
         let bytesPerRow = bytesPerPixel * width
         var pixelData = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: &pixelData,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
+        guard
+            let ctx = CGContext(
+                data: &pixelData,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
             throw ValidationError("Failed to create CGContext")
         }
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
@@ -124,14 +114,14 @@ struct PixelSort: ParsableCommand {
             bytesPerRow: bytesPerRow
         )
 
-        // Load shaders
-        let shaderSource = try String(contentsOf: Bundle.module.url(forResource: "Shaders", withExtension: "metal")!, encoding: .utf8)
+        let shaderSource = try String(
+            contentsOf: Bundle.module.url(forResource: "Shaders", withExtension: "metal")!,
+            encoding: .utf8)
         let library = ShaderLibrary.source(shaderSource)
 
         var createMaskPipeline = try compute.makePipeline(function: library.createMask)
         var clearSpanPipeline = try compute.makePipeline(function: library.clearSpanBuffer)
         var identifySpansPipeline = try compute.makePipeline(function: library.identifySpans)
-        var rgbToValPipeline = try compute.makePipeline(function: library.rgbToSortValue)
         var pixelSortPipeline = try compute.makePipeline(function: library.pixelSortSpan)
         var compositePipeline = try compute.makePipeline(function: library.composite)
 
@@ -146,40 +136,34 @@ struct PixelSort: ParsableCommand {
             maxSpanLength: UInt32(maxSpan ?? width),
             invertMask: invertMask ? 1 : 0
         )
-        let paramBuffer = device.makeBuffer(bytes: &params, length: MemoryLayout<Params>.stride, options: .storageModeShared)!
+        let paramBuffer = device.makeBuffer(
+            bytes: &params, length: MemoryLayout<Params>.stride, options: .storageModeShared)!
 
-        // 1) Mask
+        // Mask
         createMaskPipeline.arguments.colorTex = .texture(texA)
         createMaskPipeline.arguments.maskTex = .texture(maskTex)
         createMaskPipeline.arguments.params = .buffer(paramBuffer)
         try compute.run(pipeline: createMaskPipeline, width: width, height: height)
 
-        // 2) Clear span buffer
+        // Clear span buffer
         clearSpanPipeline.arguments.spanTex = .texture(spanTex)
         clearSpanPipeline.arguments.params = .buffer(paramBuffer)
         try compute.run(pipeline: clearSpanPipeline, width: width, height: height)
 
-        // 3) Identify spans (1 thread per row: dispatch width=1)
+        // Identify spans (1 thread per row: dispatch width=1)
         identifySpansPipeline.arguments.maskTex = .texture(maskTex)
         identifySpansPipeline.arguments.spanTex = .texture(spanTex)
         identifySpansPipeline.arguments.params = .buffer(paramBuffer)
         try compute.run(pipeline: identifySpansPipeline, width: 1, height: height)
 
-        // 4) Sort values
-        rgbToValPipeline.arguments.colorTex = .texture(texA)
-        rgbToValPipeline.arguments.valTex = .texture(valTex)
-        rgbToValPipeline.arguments.params = .buffer(paramBuffer)
-        try compute.run(pipeline: rgbToValPipeline, width: width, height: height)
-
-        // 5) Sort each span into sortedTex
+        // Sort each span into sortedTex
         pixelSortPipeline.arguments.colorTex = .texture(texA)
-        pixelSortPipeline.arguments.valTex = .texture(valTex)
         pixelSortPipeline.arguments.spanTex = .texture(spanTex)
         pixelSortPipeline.arguments.sortedTex = .texture(sortedTex)
         pixelSortPipeline.arguments.params = .buffer(paramBuffer)
-        try compute.run(pipeline: pixelSortPipeline, width: width, height: height)
+        try compute.run(pipeline: pixelSortPipeline, width: 1, height: height)
 
-        // 6) Composite only masked pixels into output texB
+        // Composite only masked pixels into output texB
         compositePipeline.arguments.maskTex = .texture(maskTex)
         compositePipeline.arguments.sortedTex = .texture(sortedTex)
         compositePipeline.arguments.originalTex = .texture(texA)
@@ -187,7 +171,6 @@ struct PixelSort: ParsableCommand {
         compositePipeline.arguments.params = .buffer(paramBuffer)
         try compute.run(pipeline: compositePipeline, width: width, height: height)
 
-        // Read back from output
         var outputData = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
         texB.getBytes(
             &outputData,
@@ -196,17 +179,17 @@ struct PixelSort: ParsableCommand {
             mipmapLevel: 0
         )
 
-        // Save output
-        guard let outCtx = CGContext(
-            data: &outputData,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ),
-        let outCGImage = outCtx.makeImage()
+        guard
+            let outCtx = CGContext(
+                data: &outputData,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ),
+            let outCGImage = outCtx.makeImage()
         else {
             throw ValidationError("Failed to create output image")
         }
@@ -222,8 +205,6 @@ struct PixelSort: ParsableCommand {
         print("Pixel-sorted image saved to \(self.output) (\(width)×\(height))")
     }
 }
-
-// MARK: - Helpers
 
 struct Params {
     var width: UInt32
@@ -242,12 +223,12 @@ enum SortKeyOption: String, ExpressibleByArgument, CaseIterable {
 
     var metalValue: Int {
         switch self {
-        case .brightness:  return 0
-        case .hue:         return 1
-        case .saturation:  return 2
-        case .red:         return 3
-        case .green:       return 4
-        case .blue:        return 5
+        case .brightness: return 0
+        case .hue: return 1
+        case .saturation: return 2
+        case .red: return 3
+        case .green: return 4
+        case .blue: return 5
         }
     }
 }
