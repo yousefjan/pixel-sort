@@ -78,7 +78,7 @@ kernel void createMask(
     maskTex.write(m, gid);
 }
 
-// --- full-frame sort-by scalars (one float per pixel) ---
+// --- sort-by scalars ---
 
 kernel void buildSortKeys(
     texture2d<float, access::read>   colorTex   [[texture(0)]],
@@ -140,7 +140,7 @@ kernel void identifySpans(
     }
 }
 
-// --- prepare indirect dispatch arguments from span count ---
+// --- prepare arguments from span count ---
 
 struct IndirectArgs {
     uint threadgroupsX;
@@ -160,58 +160,67 @@ kernel void prepareIndirectArgs(
     indirectArgs->threadgroupsZ = 1;
 }
 
-// --- sort pixels within a span (one thread per span, indirect dispatch) ---
+// --- sort pixels within a span ---
 
-constant uint MAX_LOCAL_SPAN = 2048;
+constant uint TG_SIZE = 1024;
+constant uint MAX_SPAN = 2048;  // 1024 threads x 2 elements each
 
 kernel void pixelSortSpan(
-    texture2d<float, access::read>  colorTex     [[texture(0)]],
-    texture2d<float, access::read> sortKeyTex   [[texture(1)]],
+    texture2d<float, access::read>  colorTex    [[texture(0)]],
+    texture2d<float, access::read>  sortKeyTex  [[texture(1)]],
     texture2d<float, access::write> sortedTex   [[texture(2)]],
     constant Params &params                     [[buffer(0)]],
     device const SpanDescriptor *spanBuffer     [[buffer(1)]],
-    uint gid                                    [[thread_position_in_grid]]
+    uint tgid                                   [[threadgroup_position_in_grid]],
+    uint tid                                    [[thread_index_in_threadgroup]]
 ) {
-    SpanDescriptor span = spanBuffer[gid];
-    uint row = span.row;
-    uint x = span.startX;
-    uint spanLength = min(span.length, params.width - x);
-    spanLength = min(spanLength, max(1u, params.maxSpanLength));
-    spanLength = min(spanLength, MAX_LOCAL_SPAN);
+    threadgroup float  keys[MAX_SPAN];
+    threadgroup ushort orig[MAX_SPAN];
 
-    float cache[MAX_LOCAL_SPAN];
-    for (uint k = 0; k < spanLength; ++k) {
-        cache[k] = sortKeyTex.read(uint2(x + k, row)).x;
+    SpanDescriptor span = spanBuffer[tgid];
+    uint row    = span.row;
+    uint startX = span.startX;
+    uint len    = min(span.length, params.width - startX);
+    len = min(len, max(1u, params.maxSpanLength));
+    len = min(len, MAX_SPAN);
+
+    uint n = 1;
+    while (n < len) n <<= 1;
+
+    float sentinel = params.reverseSorting ? 2.0f : -2.0f;
+
+    for (uint i = tid; i < n; i += TG_SIZE) {
+        if (i < len) {
+            keys[i] = sortKeyTex.read(uint2(startX + i, row)).x;
+            orig[i] = ushort(i);
+        } else {
+            keys[i] = sentinel;
+            orig[i] = ushort(i);
+        }
     }
 
-    float minValue = cache[0];
-    float maxValue = cache[0];
-    uint minIndex = 0;
-    uint maxIndex = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint steps = (spanLength / 2) + 1;
-    for (uint i = 0; i < steps; ++i) {
-        for (uint j = 1; j < spanLength; ++j) {
-            float v = cache[j];
-            if (v >= 0.0f && v <= 1.0f) {
-                if (v < minValue) { minValue = v; minIndex = j; }
-                if (maxValue < v) { maxValue = v; maxIndex = j; }
+    uint halfN = n >> 1;
+    for (uint k = 2; k <= n; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint t = tid; t < halfN; t += TG_SIZE) {
+                uint lo = t + (t & ~(j - 1));  // insert 0-bit at position of j
+                uint hi = lo + j;
+                bool ascending = ((lo & k) == 0) == bool(params.reverseSorting);
+                if ((ascending && keys[lo] > keys[hi]) ||
+                    (!ascending && keys[lo] < keys[hi])) {
+                    float  tmpK = keys[lo]; keys[lo] = keys[hi]; keys[hi] = tmpK;
+                    ushort tmpI = orig[lo]; orig[lo] = orig[hi]; orig[hi] = tmpI;
+                }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+    }
 
-        uint dstMin = params.reverseSorting ? i : (spanLength - i - 1);
-        uint dstMax = params.reverseSorting ? (spanLength - i - 1) : i;
-
-        float4 cMin = colorTex.read(uint2(x + minIndex, row));
-        float4 cMax = colorTex.read(uint2(x + maxIndex, row));
-
-        sortedTex.write(cMin, uint2(x + dstMin, row));
-        sortedTex.write(cMax, uint2(x + dstMax, row));
-
-        cache[minIndex] = 2.0f;
-        cache[maxIndex] = -2.0f;
-        minValue = 1.0f;
-        maxValue = -1.0f;
+    for (uint i = tid; i < len; i += TG_SIZE) {
+        float4 c = colorTex.read(uint2(startX + orig[i], row));
+        sortedTex.write(c, uint2(startX + i, row));
     }
 }
 

@@ -179,7 +179,7 @@ struct PixelSort: ParsableCommand {
         prepareIndirectArgsPipeline.arguments.indirectArgs = .buffer(indirectArgsBuffer)
         try compute.run(pipeline: prepareIndirectArgsPipeline, width: 1, height: 1)
 
-        // Sort each span into sortedTex (one thread per span)
+        // Sort each span into sortedTex (one threadgroup per span, bitonic sort)
         try compute.task(label: "pixelSort") { task in
             try task.run { dispatch in
                 let enc = dispatch.commandEncoder
@@ -192,7 +192,7 @@ struct PixelSort: ParsableCommand {
                 enc.dispatchThreadgroups(
                     indirectBuffer: indirectArgsBuffer,
                     indirectBufferOffset: 0,
-                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+                    threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1)
                 )
             }
         }
