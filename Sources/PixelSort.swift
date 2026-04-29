@@ -78,6 +78,16 @@ struct PixelSort: ParsableCommand {
         let maskTex = device.makeTexture(descriptor: maskDesc)!
         maskTex.label = "mask"
 
+        let sortKeyDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        sortKeyDesc.usage = [.shaderRead, .shaderWrite]
+        let sortKeyTex = device.makeTexture(descriptor: sortKeyDesc)!
+        sortKeyTex.label = "sortKeys"
+
         // Span descriptor buffer (max one span per pixel is a safe upper bound)
         let maxSpans = width * height
         let spanBufferSize = maxSpans * MemoryLayout<SpanDescriptor>.stride
@@ -126,6 +136,7 @@ struct PixelSort: ParsableCommand {
         let library = ShaderLibrary.source(shaderSource)
 
         var createMaskPipeline = try compute.makePipeline(function: library.createMask)
+        var buildSortKeysPipeline = try compute.makePipeline(function: library.buildSortKeys)
         var identifySpansPipeline = try compute.makePipeline(function: library.identifySpans)
         var prepareIndirectArgsPipeline = try compute.makePipeline(
             function: library.prepareIndirectArgs)
@@ -148,6 +159,11 @@ struct PixelSort: ParsableCommand {
 
         counterBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee = 0
 
+        buildSortKeysPipeline.arguments.colorTex = .texture(texA)
+        buildSortKeysPipeline.arguments.sortKeyTex = .texture(sortKeyTex)
+        buildSortKeysPipeline.arguments.params = .buffer(paramBuffer)
+        try compute.run(pipeline: buildSortKeysPipeline, width: width, height: height)
+
         createMaskPipeline.arguments.colorTex = .texture(texA)
         createMaskPipeline.arguments.maskTex = .texture(maskTex)
         createMaskPipeline.arguments.params = .buffer(paramBuffer)
@@ -169,7 +185,8 @@ struct PixelSort: ParsableCommand {
                 let enc = dispatch.commandEncoder
                 enc.setComputePipelineState(pixelSortPipeline.computePipelineState)
                 enc.setTexture(texA, index: 0)
-                enc.setTexture(sortedTex, index: 1)
+                enc.setTexture(sortKeyTex, index: 1)
+                enc.setTexture(sortedTex, index: 2)
                 enc.setBuffer(paramBuffer, offset: 0, index: 0)
                 enc.setBuffer(spanBuffer, offset: 0, index: 1)
                 enc.dispatchThreadgroups(

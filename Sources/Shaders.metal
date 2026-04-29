@@ -78,6 +78,20 @@ kernel void createMask(
     maskTex.write(m, gid);
 }
 
+// --- full-frame sort-by scalars (one float per pixel) ---
+
+kernel void buildSortKeys(
+    texture2d<float, access::read>   colorTex   [[texture(0)]],
+    texture2d<float, access::write> sortKeyTex  [[texture(1)]],
+    constant Params &params                       [[buffer(0)]],
+    uint2 gid                                     [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.width || gid.y >= params.height) return;
+    float3 rgb = saturate(colorTex.read(gid).rgb);
+    float v = sort_value(rgb, params.sortKey);
+    sortKeyTex.write(float4(v, 0.0f, 0.0f, 0.0f), gid);
+}
+
 // --- span descriptor for indirect dispatch ---
 
 struct SpanDescriptor {
@@ -151,8 +165,9 @@ kernel void prepareIndirectArgs(
 constant uint MAX_LOCAL_SPAN = 2048;
 
 kernel void pixelSortSpan(
-    texture2d<float, access::read>  colorTex    [[texture(0)]],
-    texture2d<float, access::write> sortedTex   [[texture(1)]],
+    texture2d<float, access::read>  colorTex     [[texture(0)]],
+    texture2d<float, access::read> sortKeyTex   [[texture(1)]],
+    texture2d<float, access::write> sortedTex   [[texture(2)]],
     constant Params &params                     [[buffer(0)]],
     device const SpanDescriptor *spanBuffer     [[buffer(1)]],
     uint gid                                    [[thread_position_in_grid]]
@@ -166,8 +181,7 @@ kernel void pixelSortSpan(
 
     float cache[MAX_LOCAL_SPAN];
     for (uint k = 0; k < spanLength; ++k) {
-        float3 rgb = saturate(colorTex.read(uint2(x + k, row)).rgb);
-        cache[k] = sort_value(rgb, params.sortKey);
+        cache[k] = sortKeyTex.read(uint2(x + k, row)).x;
     }
 
     float minValue = cache[0];
