@@ -78,15 +78,21 @@ struct PixelSort: ParsableCommand {
         let maskTex = device.makeTexture(descriptor: maskDesc)!
         maskTex.label = "mask"
 
-        let spanDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .r32Uint,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        spanDesc.usage = [.shaderRead, .shaderWrite]
-        let spanTex = device.makeTexture(descriptor: spanDesc)!
-        spanTex.label = "spans"
+        // Span descriptor buffer (max one span per pixel is a safe upper bound)
+        let maxSpans = width * height
+        let spanBufferSize = maxSpans * MemoryLayout<SpanDescriptor>.stride
+        let spanBuffer = device.makeBuffer(length: spanBufferSize, options: .storageModeShared)!
+        spanBuffer.label = "spanBuffer"
+
+        // Atomic counter for number of spans found
+        let counterBuffer = device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        counterBuffer.label = "spanCount"
+
+        // Indirect dispatch arguments buffer (3 x uint32)
+        let indirectArgsBuffer = device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride * 3, options: .storageModeShared)!
+        indirectArgsBuffer.label = "indirectArgs"
 
         let bytesPerPixel = 4
         let bytesPerRow = bytesPerPixel * width
@@ -120,9 +126,10 @@ struct PixelSort: ParsableCommand {
         let library = ShaderLibrary.source(shaderSource)
 
         var createMaskPipeline = try compute.makePipeline(function: library.createMask)
-        var clearSpanPipeline = try compute.makePipeline(function: library.clearSpanBuffer)
         var identifySpansPipeline = try compute.makePipeline(function: library.identifySpans)
-        var pixelSortPipeline = try compute.makePipeline(function: library.pixelSortSpan)
+        var prepareIndirectArgsPipeline = try compute.makePipeline(
+            function: library.prepareIndirectArgs)
+        let pixelSortPipeline = try compute.makePipeline(function: library.pixelSortSpan)
         var compositePipeline = try compute.makePipeline(function: library.composite)
 
         var params = Params(
@@ -139,31 +146,41 @@ struct PixelSort: ParsableCommand {
         let paramBuffer = device.makeBuffer(
             bytes: &params, length: MemoryLayout<Params>.stride, options: .storageModeShared)!
 
-        // Mask
+        counterBuffer.contents().assumingMemoryBound(to: UInt32.self).pointee = 0
+
         createMaskPipeline.arguments.colorTex = .texture(texA)
         createMaskPipeline.arguments.maskTex = .texture(maskTex)
         createMaskPipeline.arguments.params = .buffer(paramBuffer)
         try compute.run(pipeline: createMaskPipeline, width: width, height: height)
 
-        // Clear span buffer
-        clearSpanPipeline.arguments.spanTex = .texture(spanTex)
-        clearSpanPipeline.arguments.params = .buffer(paramBuffer)
-        try compute.run(pipeline: clearSpanPipeline, width: width, height: height)
-
-        // Identify spans (1 thread per row: dispatch width=1)
         identifySpansPipeline.arguments.maskTex = .texture(maskTex)
-        identifySpansPipeline.arguments.spanTex = .texture(spanTex)
         identifySpansPipeline.arguments.params = .buffer(paramBuffer)
+        identifySpansPipeline.arguments.spanBuffer = .buffer(spanBuffer)
+        identifySpansPipeline.arguments.spanCount = .buffer(counterBuffer)
         try compute.run(pipeline: identifySpansPipeline, width: 1, height: height)
 
-        // Sort each span into sortedTex
-        pixelSortPipeline.arguments.colorTex = .texture(texA)
-        pixelSortPipeline.arguments.spanTex = .texture(spanTex)
-        pixelSortPipeline.arguments.sortedTex = .texture(sortedTex)
-        pixelSortPipeline.arguments.params = .buffer(paramBuffer)
-        try compute.run(pipeline: pixelSortPipeline, width: 1, height: height)
+        prepareIndirectArgsPipeline.arguments.spanCount = .buffer(counterBuffer)
+        prepareIndirectArgsPipeline.arguments.indirectArgs = .buffer(indirectArgsBuffer)
+        try compute.run(pipeline: prepareIndirectArgsPipeline, width: 1, height: 1)
 
-        // Composite only masked pixels into output texB
+        // Sort each span into sortedTex (one thread per span)
+        try compute.task(label: "pixelSort") { task in
+            try task.run { dispatch in
+                let enc = dispatch.commandEncoder
+                enc.setComputePipelineState(pixelSortPipeline.computePipelineState)
+                enc.setTexture(texA, index: 0)
+                enc.setTexture(sortedTex, index: 1)
+                enc.setBuffer(paramBuffer, offset: 0, index: 0)
+                enc.setBuffer(spanBuffer, offset: 0, index: 1)
+                enc.dispatchThreadgroups(
+                    indirectBuffer: indirectArgsBuffer,
+                    indirectBufferOffset: 0,
+                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+                )
+            }
+        }
+
+        // composite only masked pixels into output texB
         compositePipeline.arguments.maskTex = .texture(maskTex)
         compositePipeline.arguments.sortedTex = .texture(sortedTex)
         compositePipeline.arguments.originalTex = .texture(texA)
@@ -204,6 +221,12 @@ struct PixelSort: ParsableCommand {
 
         print("Pixel-sorted image saved to \(self.output) (\(width)×\(height))")
     }
+}
+
+struct SpanDescriptor {
+    var row: UInt32
+    var startX: UInt32
+    var length: UInt32
 }
 
 struct Params {

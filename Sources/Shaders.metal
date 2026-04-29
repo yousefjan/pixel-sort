@@ -56,7 +56,7 @@ struct Params {
     float lowerThreshold; // luminance low
     float upperThreshold; // luminance high
     uint  reverseSorting; // 0 = normal, 1 = reverse
-    float gamma;          // output gamma (Unity applies pow(abs(sorted), gamma))
+    float gamma;          // output gamma
     uint  maxSpanLength;  // clamp span length (safety)
     uint  invertMask;     // 0/1
 };
@@ -78,24 +78,22 @@ kernel void createMask(
     maskTex.write(m, gid);
 }
 
-// --- clear span buffer ---
+// --- span descriptor for indirect dispatch ---
 
-kernel void clearSpanBuffer(
-    texture2d<uint, access::write> spanTex [[texture(0)]],
-    constant Params &params                [[buffer(0)]],
-    uint2 gid                              [[thread_position_in_grid]]
-) {
-    if (gid.x >= params.width || gid.y >= params.height) return;
-    spanTex.write(0u, gid);
-}
+struct SpanDescriptor {
+    uint row;
+    uint startX;
+    uint length;
+};
 
-// --- identify spans w mask ---
+// --- identify spans and build span buffer ---
 
 kernel void identifySpans(
-    texture2d<uint, access::read>  maskTex [[texture(0)]],
-    texture2d<uint, access::write> spanTex [[texture(1)]],
-    constant Params &params                [[buffer(0)]],
-    uint2 gid                              [[thread_position_in_grid]]
+    texture2d<uint, access::read>  maskTex     [[texture(0)]],
+    constant Params &params                    [[buffer(0)]],
+    device SpanDescriptor *spanBuffer          [[buffer(1)]],
+    device atomic_uint *spanCount              [[buffer(2)]],
+    uint2 gid                                  [[thread_position_in_grid]]
 ) {
     uint row = gid.y;
     if (gid.x != 0 || row >= params.height) return;
@@ -112,7 +110,8 @@ kernel void identifySpans(
         if (m == 0 || spanLength >= spanLimit) {
             if (spanLength != 0) {
                 uint outLen = (m == 1u) ? (spanLength + 1u) : spanLength;
-                spanTex.write(outLen, uint2(spanStart, row));
+                uint idx = atomic_fetch_add_explicit(spanCount, 1, memory_order_relaxed);
+                spanBuffer[idx] = SpanDescriptor { row, spanStart, outLen };
             }
             spanStart = pos;
             spanLength = 0;
@@ -122,68 +121,83 @@ kernel void identifySpans(
     }
 
     if (spanLength != 0 && spanStart < params.width) {
-        spanTex.write(spanLength, uint2(spanStart, row));
+        uint idx = atomic_fetch_add_explicit(spanCount, 1, memory_order_relaxed);
+        spanBuffer[idx] = SpanDescriptor { row, spanStart, spanLength };
     }
 }
 
-// --- sort pixels within a span ---
+// --- prepare indirect dispatch arguments from span count ---
+
+struct IndirectArgs {
+    uint threadgroupsX;
+    uint threadgroupsY;
+    uint threadgroupsZ;
+};
+
+kernel void prepareIndirectArgs(
+    device atomic_uint *spanCount      [[buffer(0)]],
+    device IndirectArgs *indirectArgs  [[buffer(1)]],
+    uint gid                           [[thread_position_in_grid]]
+) {
+    if (gid != 0) return;
+    uint count = atomic_load_explicit(spanCount, memory_order_relaxed);
+    indirectArgs->threadgroupsX = count;
+    indirectArgs->threadgroupsY = 1;
+    indirectArgs->threadgroupsZ = 1;
+}
+
+// --- sort pixels within a span (one thread per span, indirect dispatch) ---
 
 constant uint MAX_LOCAL_SPAN = 2048;
 
 kernel void pixelSortSpan(
-    texture2d<float, access::read>  colorTex  [[texture(0)]],
-    texture2d<uint, access::read>   spanTex   [[texture(2)]],
-    texture2d<float, access::write> sortedTex [[texture(3)]],
-    constant Params &params                   [[buffer(0)]],
-    uint2 gid                                 [[thread_position_in_grid]]
+    texture2d<float, access::read>  colorTex    [[texture(0)]],
+    texture2d<float, access::write> sortedTex   [[texture(1)]],
+    constant Params &params                     [[buffer(0)]],
+    device const SpanDescriptor *spanBuffer     [[buffer(1)]],
+    uint gid                                    [[thread_position_in_grid]]
 ) {
-    uint row = gid.y;
-    if (gid.x != 0 || row >= params.height) return;
+    SpanDescriptor span = spanBuffer[gid];
+    uint row = span.row;
+    uint x = span.startX;
+    uint spanLength = min(span.length, params.width - x);
+    spanLength = min(spanLength, max(1u, params.maxSpanLength));
+    spanLength = min(spanLength, MAX_LOCAL_SPAN);
 
-    for (uint x = 0; x < params.width; ++x) {
-        uint spanLength = spanTex.read(uint2(x, row)).x;
-        if (spanLength == 0) continue;
+    float cache[MAX_LOCAL_SPAN];
+    for (uint k = 0; k < spanLength; ++k) {
+        float3 rgb = saturate(colorTex.read(uint2(x + k, row)).rgb);
+        cache[k] = sort_value(rgb, params.sortKey);
+    }
 
-        spanLength = min(spanLength, params.width - x);
-        spanLength = min(spanLength, max(1u, params.maxSpanLength));
-        spanLength = min(spanLength, MAX_LOCAL_SPAN);
+    float minValue = cache[0];
+    float maxValue = cache[0];
+    uint minIndex = 0;
+    uint maxIndex = 0;
 
-        float cache[MAX_LOCAL_SPAN];
-        for (uint k = 0; k < spanLength; ++k) {
-            float3 rgb = saturate(colorTex.read(uint2(x + k, row)).rgb);
-            cache[k] = sort_value(rgb, params.sortKey);
-        }
-
-        float minValue = cache[0];
-        float maxValue = cache[0];
-        uint minIndex = 0;
-        uint maxIndex = 0;
-
-        uint steps = (spanLength / 2) + 1;
-        for (uint i = 0; i < steps; ++i) {
-            for (uint j = 1; j < spanLength; ++j) {
-                float v = cache[j];
-                if (v >= 0.0f && v <= 1.0f) {
-                    if (v < minValue) { minValue = v; minIndex = j; }
-                    if (maxValue < v) { maxValue = v; maxIndex = j; }
-                }
+    uint steps = (spanLength / 2) + 1;
+    for (uint i = 0; i < steps; ++i) {
+        for (uint j = 1; j < spanLength; ++j) {
+            float v = cache[j];
+            if (v >= 0.0f && v <= 1.0f) {
+                if (v < minValue) { minValue = v; minIndex = j; }
+                if (maxValue < v) { maxValue = v; maxIndex = j; }
             }
-
-            uint dstMin = params.reverseSorting ? i : (spanLength - i - 1);
-            uint dstMax = params.reverseSorting ? (spanLength - i - 1) : i;
-
-            float4 cMin = colorTex.read(uint2(x + minIndex, row));
-            float4 cMax = colorTex.read(uint2(x + maxIndex, row));
-
-            sortedTex.write(cMin, uint2(x + dstMin, row));
-            sortedTex.write(cMax, uint2(x + dstMax, row));
-
-            cache[minIndex] = 2.0f;
-            cache[maxIndex] = -2.0f;
-            minValue = 1.0f;
-            maxValue = -1.0f;
         }
-        x += (spanLength - 1);
+
+        uint dstMin = params.reverseSorting ? i : (spanLength - i - 1);
+        uint dstMax = params.reverseSorting ? (spanLength - i - 1) : i;
+
+        float4 cMin = colorTex.read(uint2(x + minIndex, row));
+        float4 cMax = colorTex.read(uint2(x + maxIndex, row));
+
+        sortedTex.write(cMin, uint2(x + dstMin, row));
+        sortedTex.write(cMax, uint2(x + dstMax, row));
+
+        cache[minIndex] = 2.0f;
+        cache[maxIndex] = -2.0f;
+        minValue = 1.0f;
+        maxValue = -1.0f;
     }
 }
 
