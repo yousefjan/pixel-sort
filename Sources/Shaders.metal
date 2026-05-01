@@ -176,6 +176,7 @@ kernel void pixelSortSpan(
 ) {
     threadgroup float  keys[MAX_SPAN];
     threadgroup ushort orig[MAX_SPAN];
+    threadgroup half4  colors[MAX_SPAN];
 
     SpanDescriptor span = spanBuffer[tgid];
     uint row    = span.row;
@@ -191,7 +192,9 @@ kernel void pixelSortSpan(
 
     for (uint i = tid; i < n; i += TG_SIZE) {
         if (i < len) {
-            keys[i] = sortKeyTex.read(uint2(startX + i, row)).x;
+            uint2 coord = uint2(startX + i, row);
+            keys[i] = sortKeyTex.read(coord).x;
+            colors[i] = half4(colorTex.read(coord));
             orig[i] = ushort(i);
         } else {
             keys[i] = sentinel;
@@ -219,8 +222,7 @@ kernel void pixelSortSpan(
     }
 
     for (uint i = tid; i < len; i += TG_SIZE) {
-        float4 c = colorTex.read(uint2(startX + orig[i], row));
-        sortedTex.write(c, uint2(startX + i, row));
+        sortedTex.write(float4(colors[orig[i]]), uint2(startX + i, row));
     }
 }
 
